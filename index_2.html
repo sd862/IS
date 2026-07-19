@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="theme-color" content="#1E9E6B" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="description" content="誘發式肺量訓練 App — 呼吸訓練與吸球顆數記錄" />
+<title>誘發式肺量訓練</title>
+
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7/babel.min.js"></script>
+
+<style>
+  html, body { height: 100%; margin: 0; padding: 0; overflow: hidden; background: #F3FAF8; }
+  #root { height: 100%; width: 100%; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef, useCallback } = React;
+
+/* ---------------------------------------------------------
+   誘發式肺量訓練 · Incentive Spirometer Trainer
+   強制橫向顯示（直放手機時自動旋轉畫面）
+   循環：慢慢吐氣(3s) → 深而快吸氣(1s) → 持續吸氣(2s)
+        → 球緩緩落下(2s) → 選擇這次吸了幾顆球(+音效+訊息)
+        → 準備吐氣 → 重新開始
+--------------------------------------------------------- */
+
+/* ---------------- 簡易圖示（取代 lucide-react） ---------------- */
+function Icon({ children, size = 20, color = "currentColor", strokeWidth = 2, style }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
+      strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" style={style}>
+      {children}
+    </svg>
+  );
+}
+const PlayIcon = (p) => (
+  <Icon {...p}><polygon points="6 3 20 12 6 21 6 3" fill={p.color || "currentColor"} stroke="none" /></Icon>
+);
+const PauseIcon = (p) => (
+  <Icon {...p}>
+    <rect x="14" y="4" width="4" height="16" rx="1" fill={p.color || "currentColor"} stroke="none" />
+    <rect x="6" y="4" width="4" height="16" rx="1" fill={p.color || "currentColor"} stroke="none" />
+  </Icon>
+);
+const RotateCcwIcon = (p) => (
+  <Icon {...p}>
+    <path d="M3 12a9 9 0 1 0 2.64-6.36L3 8" />
+    <path d="M3 3v5h5" />
+  </Icon>
+);
+const ChevronUpIcon = (p) => (
+  <Icon {...p}><path d="m18 15-6-6-6 6" /></Icon>
+);
+const FlagIcon = (p) => (
+  <Icon {...p} strokeWidth={2}>
+    <path d="M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z"
+      fill={p.fill && p.fill !== "none" ? p.fill : "none"} />
+    <line x1="4" x2="4" y1="22" y2="15" />
+  </Icon>
+);
+
+const STAGES = [
+  { key: "exhale", label: "慢慢吐氣", hint: "放鬆肺部，緩緩吐氣到底", duration: 3, color: "#1E9E6B", soft: "#E4F6EE", glow: "rgba(30,158,107,0.4)", arrow: "down" },
+  { key: "quick", label: "深而快吸氣", hint: "快速深吸一口氣", duration: 1, color: "#2E6BE6", soft: "#E7EEFD", glow: "rgba(46,107,230,0.42)", arrow: "up" },
+  { key: "hold", label: "持續吸氣", hint: "維持吸力，讓球停在頂端", duration: 2, color: "#E07A2C", soft: "#FCEEE0", glow: "rgba(224,122,44,0.4)", arrow: "hold" },
+];
+
+const TICK_MS = 50;
+const TARGET_BALLS = 18;
+const FALL_MS = 2000;
+const RESULT_MS = 2000;
+const PREPARE_MS = 1300;
+
+const RESULTS = {
+  0: { icon: "💪", message: "加油，你可以的！" },
+  1: { icon: "✨", message: "第二顆在動囉！" },
+  2: { icon: "🔥", message: "快要成功了！" },
+  3: { icon: "🏆", message: "你真棒，超級厲害！" },
+};
+
+/* ---------------- Web Audio sound design ---------------- */
+
+function newCtx() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  return new Ctx();
+}
+function closeLater(ctx, secs) {
+  setTimeout(() => { try { ctx.close(); } catch (e) {} }, secs * 1000);
+}
+function makeNoiseBuffer(ctx, dur) {
+  const n = Math.max(1, Math.floor(ctx.sampleRate * dur));
+  const buf = ctx.createBuffer(1, n, ctx.sampleRate);
+  const d = buf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = Math.random() * 2 - 1;
+  return buf;
+}
+function burstNoise(ctx, { start = 0, dur = 0.25, freqStart = 800, freqEnd = 1600, gainPeak = 0.3, q = 1 }) {
+  const src = ctx.createBufferSource();
+  src.buffer = makeNoiseBuffer(ctx, dur);
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.Q.value = q;
+  filter.frequency.setValueAtTime(freqStart, ctx.currentTime + start);
+  filter.frequency.linearRampToValueAtTime(freqEnd, ctx.currentTime + start + dur);
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0, ctx.currentTime + start);
+  gain.gain.linearRampToValueAtTime(gainPeak, ctx.currentTime + start + dur * 0.15);
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+  src.connect(filter).connect(gain).connect(ctx.destination);
+  src.start(ctx.currentTime + start);
+  src.stop(ctx.currentTime + start + dur + 0.02);
+}
+function tone(ctx, { start = 0, freq = 440, dur = 0.2, gainPeak = 0.2, type = "sine" }) {
+  const osc = ctx.createOscillator();
+  osc.type = type;
+  osc.frequency.value = freq;
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0, ctx.currentTime + start);
+  gain.gain.linearRampToValueAtTime(gainPeak, ctx.currentTime + start + 0.02);
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(ctx.currentTime + start);
+  osc.stop(ctx.currentTime + start + dur + 0.02);
+}
+function sweepTone(ctx, { start = 0, freqStart = 500, freqEnd = 150, dur = 0.5, gainPeak = 0.22 }) {
+  const osc = ctx.createOscillator();
+  osc.type = "sine";
+  osc.frequency.setValueAtTime(freqStart, ctx.currentTime + start);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(freqEnd, 40), ctx.currentTime + start + dur);
+  const gain = ctx.createGain();
+  gain.gain.setValueAtTime(0, ctx.currentTime + start);
+  gain.gain.linearRampToValueAtTime(gainPeak, ctx.currentTime + start + 0.05);
+  gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + start + dur);
+  osc.connect(gain).connect(ctx.destination);
+  osc.start(ctx.currentTime + start);
+  osc.stop(ctx.currentTime + start + dur + 0.02);
+}
+
+function playExhaleCue() {
+  try {
+    const ctx = newCtx();
+    sweepTone(ctx, { start: 0, freqStart: 640, freqEnd: 260, dur: 0.8, gainPeak: 0.16 });
+    closeLater(ctx, 1);
+  } catch (e) {}
+}
+function playInhaleSound() {
+  try {
+    const ctx = newCtx();
+    burstNoise(ctx, { start: 0, dur: 0.45, freqStart: 350, freqEnd: 2400, gainPeak: 0.42, q: 0.6 });
+    burstNoise(ctx, { start: 0.02, dur: 0.4, freqStart: 900, freqEnd: 3000, gainPeak: 0.2, q: 1.4 });
+    closeLater(ctx, 0.6);
+  } catch (e) {}
+}
+function playFallSound() {
+  try {
+    const ctx = newCtx();
+    sweepTone(ctx, { start: 0, freqStart: 520, freqEnd: 140, dur: 0.45, gainPeak: 0.2 });
+    tone(ctx, { start: 0.42, freq: 95, dur: 0.18, gainPeak: 0.32, type: "sine" });
+    tone(ctx, { start: 0.44, freq: 60, dur: 0.16, gainPeak: 0.2, type: "triangle" });
+    closeLater(ctx, 0.8);
+  } catch (e) {}
+}
+function playEffortSound() {
+  try {
+    const ctx = newCtx();
+    burstNoise(ctx, { start: 0, dur: 0.07, freqStart: 600, freqEnd: 600, gainPeak: 0.2, q: 4 });
+    burstNoise(ctx, { start: 0.11, dur: 0.07, freqStart: 700, freqEnd: 700, gainPeak: 0.24, q: 4 });
+    burstNoise(ctx, { start: 0.22, dur: 0.07, freqStart: 820, freqEnd: 820, gainPeak: 0.28, q: 4 });
+    tone(ctx, { start: 0.34, freq: 392, dur: 0.32, gainPeak: 0.24, type: "triangle" });
+    closeLater(ctx, 0.9);
+  } catch (e) {}
+}
+function playCheerSound() {
+  try {
+    const ctx = newCtx();
+    [392, 494, 587, 784].forEach((f, i) => tone(ctx, { start: i * 0.11, freq: f, dur: 0.3, gainPeak: 0.22 }));
+    closeLater(ctx, 1);
+  } catch (e) {}
+}
+function playFireworksSound() {
+  try {
+    const ctx = newCtx();
+    tone(ctx, { start: 0, freq: 70, dur: 0.25, gainPeak: 0.32, type: "sine" });
+    burstNoise(ctx, { start: 0.02, dur: 0.35, freqStart: 1200, freqEnd: 2800, gainPeak: 0.36, q: 0.6 });
+    [1046, 1318, 1568, 1760, 2093].forEach((f, i) => tone(ctx, { start: 0.16 + i * 0.09, freq: f, dur: 0.18, gainPeak: 0.16 }));
+    tone(ctx, { start: 0.55, freq: 55, dur: 0.2, gainPeak: 0.26, type: "sine" });
+    burstNoise(ctx, { start: 0.57, dur: 0.3, freqStart: 900, freqEnd: 2200, gainPeak: 0.28, q: 0.6 });
+    closeLater(ctx, 1.3);
+  } catch (e) {}
+}
+
+const RESULT_SOUND = { 0: playEffortSound, 1: playEffortSound, 2: playCheerSound, 3: playFireworksSound };
+
+function playGrandFanfare() {
+  try {
+    const ctx = newCtx();
+    tone(ctx, { start: 0, freq: 65, dur: 0.4, gainPeak: 0.35, type: "sine" });
+    burstNoise(ctx, { start: 0.02, dur: 0.4, freqStart: 1200, freqEnd: 3000, gainPeak: 0.4, q: 0.5 });
+    const notes = [523.25, 659.25, 783.99, 1046.5];
+    notes.forEach((f, i) => tone(ctx, { start: 0.15 + i * 0.13, freq: f, dur: 0.5, gainPeak: 0.24, type: "triangle" }));
+    [523.25, 659.25, 783.99].forEach((f) => tone(ctx, { start: 0.75, freq: f, dur: 0.9, gainPeak: 0.16, type: "sine" }));
+    [1568, 1760, 2093, 2349, 2637].forEach((f, i) => tone(ctx, { start: 0.3 + i * 0.11, freq: f, dur: 0.25, gainPeak: 0.15 }));
+    burstNoise(ctx, { start: 0.9, dur: 0.35, freqStart: 1000, freqEnd: 2600, gainPeak: 0.3, q: 0.6 });
+    tone(ctx, { start: 0.92, freq: 80, dur: 0.25, gainPeak: 0.3, type: "sine" });
+    closeLater(ctx, 2);
+  } catch (e) {}
+}
+
+const CONFETTI = ["🎉", "✨", "🎊", "⭐", "🏅"];
+
+/* ---------------------------------------------------------- */
+
+function ArrowIcon({ type, color, size = 30 }) {
+  if (type === "hold") {
+    return <div style={{ width: size, height: 4, borderRadius: 3, background: color }} />;
+  }
+  return (
+    <ChevronUpIcon size={size} color={color} strokeWidth={3}
+      style={{ transform: type === "down" ? "rotate(180deg)" : "rotate(0deg)" }} />
+  );
+}
+
+function getViewportDims() {
+  if (typeof window === "undefined") return { w: 375, h: 667 };
+  const vv = window.visualViewport;
+  return {
+    w: vv ? vv.width : window.innerWidth,
+    h: vv ? vv.height : window.innerHeight,
+  };
+}
+function useViewportDims() {
+  const [dims, setDims] = useState(getViewportDims);
+  useEffect(() => {
+    const onResize = () => setDims(getViewportDims());
+    window.addEventListener("resize", onResize);
+    window.addEventListener("orientationchange", onResize);
+    if (window.visualViewport) window.visualViewport.addEventListener("resize", onResize);
+    return () => {
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("orientationchange", onResize);
+      if (window.visualViewport) window.visualViewport.removeEventListener("resize", onResize);
+    };
+  }, []);
+  return dims;
+}
+
+function IncentiveSpirometer() {
+  const { w: vw, h: vh } = useViewportDims();
+  const isPortrait = vh > vw;
+  const [stageIdx, setStageIdx] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(STAGES[0].duration);
+  const [running, setRunning] = useState(false);
+  const [phase, setPhase] = useState("breathing");
+  const [round, setRound] = useState(1);
+  const [totalBalls, setTotalBalls] = useState(0);
+  const [lastPick, setLastPick] = useState(null);
+  const timeoutRef = useRef(null);
+
+  const stage = STAGES[stageIdx];
+  const progress = 1 - timeLeft / stage.duration;
+  const reached = totalBalls >= TARGET_BALLS;
+  const walkPct = Math.min(100, (totalBalls / TARGET_BALLS) * 100);
+
+  const cueForStage = (key) => {
+    if (key === "exhale") playExhaleCue();
+    else if (key === "quick") playInhaleSound();
+  };
+
+  const clearAllTimeouts = () => clearTimeout(timeoutRef.current);
+
+  const advance = useCallback(() => {
+    setStageIdx((prevIdx) => {
+      const nextIdx = prevIdx + 1;
+      if (nextIdx >= STAGES.length) {
+        setRunning(false);
+        setPhase("falling");
+        playFallSound();
+        timeoutRef.current = setTimeout(() => setPhase("selecting"), FALL_MS);
+        return prevIdx;
+      }
+      setTimeLeft(STAGES[nextIdx].duration);
+      cueForStage(STAGES[nextIdx].key);
+      return nextIdx;
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!running || phase !== "breathing") return;
+    const iv = setInterval(() => {
+      setTimeLeft((t) => {
+        const next = +(t - TICK_MS / 1000).toFixed(2);
+        if (next <= 0) { advance(); return 0; }
+        return next;
+      });
+    }, TICK_MS);
+    return () => clearInterval(iv);
+  }, [running, phase, advance]);
+
+  useEffect(() => () => clearAllTimeouts(), []);
+
+  const handleToggle = () => {
+    if (phase !== "breathing") return;
+    setRunning((r) => {
+      const next = !r;
+      if (next) cueForStage(stage.key);
+      return next;
+    });
+  };
+
+  const handleReset = () => {
+    clearAllTimeouts();
+    setRunning(false);
+    setPhase("breathing");
+    setStageIdx(0);
+    setTimeLeft(STAGES[0].duration);
+    setRound(1);
+    setTotalBalls(0);
+    setLastPick(null);
+  };
+
+  const chooseBalls = (n) => {
+    setLastPick(n);
+    const newTotal = totalBalls + n;
+    const crossedTarget = totalBalls < TARGET_BALLS && newTotal >= TARGET_BALLS;
+    setTotalBalls(newTotal);
+    RESULT_SOUND[n]();
+    setPhase("result");
+    timeoutRef.current = setTimeout(() => {
+      if (crossedTarget) {
+        playGrandFanfare();
+        setPhase("complete");
+        return;
+      }
+      setPhase("prepare");
+      setRound((r) => r + 1);
+      timeoutRef.current = setTimeout(() => {
+        setStageIdx(0);
+        setTimeLeft(STAGES[0].duration);
+        setPhase("breathing");
+        setRunning(true);
+        cueForStage("exhale");
+      }, PREPARE_MS);
+    }, RESULT_MS);
+  };
+
+  const handleDismissComplete = () => {
+    clearAllTimeouts();
+    setRound((r) => r + 1);
+    setPhase("breathing");
+    setStageIdx(0);
+    setTimeLeft(STAGES[0].duration);
+    setRunning(false);
+  };
+
+  const isInhale = stage.key === "quick" || stage.key === "hold";
+  const pulseScale = phase === "breathing" ? (isInhale ? 1 + 0.05 * progress : 1.05 - 0.05 * progress) : 1;
+
+  const ballFillPct =
+    phase === "breathing"
+      ? (stageIdx === 0 ? 0 : stageIdx === 1 ? Math.min(Math.max(progress, 0), 1) : 1)
+      : 0;
+
+  const rotWrapperStyle = isPortrait
+    ? {
+        position: "fixed", top: 0, left: 0,
+        width: `${vh}px`, height: `${vw}px`,
+        transform: "rotate(90deg) translateY(-100%)",
+        transformOrigin: "top left",
+      }
+    : { width: `${vw}px`, height: `${vh}px` };
+
+  return (
+    <div style={rotWrapperStyle}>
+      <div style={styles.page}>
+        <style>{`
+          @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700;800&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+          * { box-sizing: border-box; }
+          .num { font-variant-numeric: tabular-nums; }
+          button { font-family: inherit; cursor: pointer; }
+          @keyframes popIn { from { opacity:0; transform: scale(0.85);} to {opacity:1; transform:scale(1);} }
+          @keyframes fadeUp { from { opacity:0; transform: translateY(10px);} to {opacity:1; transform:translateY(0);} }
+          @keyframes bob { 0%,100% { transform: translateY(0);} 50% { transform: translateY(-4px);} }
+          @keyframes bounceIcon { 0% {transform:scale(0.4) rotate(-8deg); opacity:0;} 60% {transform:scale(1.15) rotate(4deg); opacity:1;} 100% {transform:scale(1) rotate(0deg);} }
+          @keyframes confettiFall { 0% { transform: translateY(0) rotate(0deg); opacity: 0; } 10% { opacity: 1; } 100% { transform: translateY(115vh) rotate(360deg); opacity: 0.9; } }
+          .ball-fall { transition: bottom ${FALL_MS}ms cubic-bezier(.5,.02,.7,.3), height ${FALL_MS}ms cubic-bezier(.5,.02,.7,.3); }
+          .ball-rise { transition: bottom ${TICK_MS}ms linear, height ${TICK_MS}ms linear; }
+          @media (prefers-reduced-motion: reduce) { *{ transition:none !important; animation:none !important; } }
+        `}</style>
+
+        <div style={styles.topBar}>
+          <div style={styles.topLeft}>
+            <span style={styles.brandDot} />
+            <span style={styles.brandText}>目標</span>
+          </div>
+          <div style={styles.trackWrap}>
+            <div style={styles.trackLine} />
+            <div style={{ ...styles.trackFill, width: `${walkPct}%` }} />
+            <div style={{ ...styles.walker, left: `calc(${walkPct}% - 20px)` }}>
+              <span style={{ display: "inline-block", fontSize: 32, animation: running ? "bob 0.6s ease-in-out infinite" : "none" }}>
+                🧑‍⚕️
+              </span>
+            </div>
+            <div style={styles.finishFlag}>
+              <FlagIcon size={20} color={reached ? "#E07A2C" : "#B9C2CC"} fill={reached ? "#E07A2C" : "none"} />
+            </div>
+          </div>
+          <div className="num" style={styles.topCount}>
+            {totalBalls}<span style={styles.topCountSlash}>/{TARGET_BALLS} 顆</span>
+          </div>
+        </div>
+
+        <div style={styles.mainRow}>
+          <section style={styles.leftPanel}>
+            <ArrowIcon type={phase === "breathing" ? stage.arrow : "down"} color={phase === "breathing" ? stage.color : "#9AA6B2"} />
+            <div className="num" style={{ ...styles.bigNumber, color: phase === "breathing" ? stage.color : "#9AA6B2" }}>
+              {phase === "breathing" ? Math.ceil(timeLeft) : "–"}
+            </div>
+            <div style={{ ...styles.stageLabel, color: phase === "breathing" ? stage.color : "#9AA6B2" }}>
+              {phase === "breathing" ? stage.label : phase === "falling" ? "球慢慢落下" : ""}
+            </div>
+            <div style={styles.stageHint}>{phase === "breathing" ? stage.hint : phase === "falling" ? "放鬆，準備記錄成果" : ""}</div>
+          </section>
+
+          <section style={styles.centerPanel}>
+            <div style={{ ...styles.ringGlow, background: `radial-gradient(circle, ${stage.glow}, transparent 70%)`, opacity: phase === "breathing" ? 1 : 0.3 }} />
+            <div style={{ ...styles.tubeRow, transform: `scale(${pulseScale})`, transition: `transform ${TICK_MS}ms linear` }}>
+              {[0, 1, 2].map((i) => (
+                <div key={i} style={styles.tubeTrack}>
+                  <div
+                    className={phase === "falling" ? "ball-fall" : "ball-rise"}
+                    style={{ ...styles.tubeFill, height: `${ballFillPct * 80}%`, background: `linear-gradient(180deg, ${stage.color}CC, ${stage.color}55)` }}
+                  />
+                  <div
+                    className={phase === "falling" ? "ball-fall" : "ball-rise"}
+                    style={{ ...styles.ball, bottom: `calc(${ballFillPct * 80}% - 3px)`, background: stage.color, boxShadow: `0 4px 10px ${stage.glow}` }}
+                  />
+                </div>
+              ))}
+            </div>
+          </section>
+
+          <section style={styles.rightPanel}>
+            <button style={styles.resetBtn} onClick={handleReset} aria-label="重新開始">
+              <RotateCcwIcon size={20} color="#4A5568" />
+            </button>
+            <button
+              style={{ ...styles.playBtn, background: stage.color, opacity: phase === "breathing" ? 1 : 0.5 }}
+              onClick={handleToggle} disabled={phase !== "breathing"}>
+              {running ? <PauseIcon size={24} color="#fff" /> : <PlayIcon size={24} color="#fff" style={{ marginLeft: 2 }} />}
+            </button>
+          </section>
+        </div>
+
+        {phase === "selecting" && (
+          <div style={styles.overlay}>
+            <div style={{ ...styles.popupCard, animation: "popIn 0.25s ease" }}>
+              <div style={styles.popupTitle}>這次吸起了幾顆球？</div>
+              <div style={styles.popupOptions}>
+                {[0, 1, 2, 3].map((n) => (
+                  <button key={n} style={styles.popupBtn} onClick={() => chooseBalls(n)}>
+                    <span className="num" style={styles.popupBtnNum}>{n}</span>
+                    <span style={styles.popupBtnUnit}>顆</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {phase === "result" && lastPick !== null && (
+          <div style={{ ...styles.overlay, background: "rgba(16,36,62,0.7)" }}>
+            <div style={{ textAlign: "center", animation: "fadeUp 0.3s ease" }}>
+              <div style={{ fontSize: 80, animation: "bounceIcon 0.5s ease" }}>{RESULTS[lastPick].icon}</div>
+              <div style={styles.resultMsg}>{RESULTS[lastPick].message}</div>
+            </div>
+          </div>
+        )}
+
+        {phase === "prepare" && (
+          <div style={{ ...styles.overlay, background: "rgba(30,158,107,0.94)" }}>
+            <div style={{ animation: "fadeUp 0.35s ease", textAlign: "center" }}>
+              <div style={styles.prepareText}>準備吐氣</div>
+              <div style={styles.prepareSub}>第 {round} 輪即將開始</div>
+            </div>
+          </div>
+        )}
+
+        {phase === "complete" && (
+          <div style={{ ...styles.overlay, background: "linear-gradient(135deg, rgba(224,122,44,0.96), rgba(224,60,120,0.94))" }}>
+            {Array.from({ length: 16 }).map((_, i) => {
+              const left = (i * 137.5) % 100;
+              const delay = (i % 8) * 0.18;
+              const dur = 1.8 + (i % 5) * 0.3;
+              const emoji = CONFETTI[i % CONFETTI.length];
+              const size = 16 + (i % 4) * 6;
+              return (
+                <span key={i} style={{
+                  position: "absolute", top: "-8%", left: `${left}%`, fontSize: size,
+                  animation: `confettiFall ${dur}s ease-in ${delay}s infinite`,
+                  opacity: 0.9, pointerEvents: "none",
+                }}>{emoji}</span>
+              );
+            })}
+            <div style={{ animation: "popIn 0.4s ease", textAlign: "center", position: "relative", zIndex: 1 }}>
+              <div style={{ fontSize: 72, animation: "bounceIcon 0.6s ease" }}>🏆</div>
+              <div style={styles.completeTitle}>超級厲害</div>
+              <div style={styles.completeSub}>休息一下吧</div>
+              <div style={styles.completeSub}>等等要再回來喔</div>
+              <button style={styles.completeBtn} onClick={handleDismissComplete}>好，我先休息</button>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const styles = {
+  page: {
+    height: "100%", width: "100%",
+    background: "linear-gradient(135deg, #F3FAF8 0%, #EAF3FB 60%, #F3FAF8 100%)",
+    fontFamily: "'IBM Plex Sans', system-ui, sans-serif",
+    display: "flex", flexDirection: "column",
+    overflow: "hidden", position: "relative",
+    padding: "clamp(8px,1.6vh,14px) clamp(10px,2vw,20px)",
+  },
+  topBar: { display: "flex", alignItems: "center", gap: 14, flexShrink: 0, height: "clamp(44px,10vh,64px)" },
+  topLeft: { display: "flex", alignItems: "center", gap: 6, flexShrink: 0 },
+  brandDot: { width: 7, height: 7, borderRadius: "50%", background: "#1E9E6B" },
+  brandText: { fontSize: 13, fontWeight: 700, color: "#5B6B7C", letterSpacing: "0.02em", whiteSpace: "nowrap" },
+  trackWrap: { position: "relative", flex: 1, height: 40 },
+  trackLine: { position: "absolute", top: "50%", left: 0, right: 0, height: 8, background: "#EEF2F5", borderRadius: 5, transform: "translateY(-50%)" },
+  trackFill: { position: "absolute", top: "50%", left: 0, height: 8, background: "linear-gradient(90deg,#2E6BE6,#1E9E6B)", borderRadius: 5, transform: "translateY(-50%)", transition: "width 0.4s ease" },
+  walker: { position: "absolute", top: -2, transition: "left 0.4s ease" },
+  finishFlag: { position: "absolute", right: -4, top: "50%", transform: "translateY(-50%)" },
+  topCount: { fontFamily: "'Space Grotesk', sans-serif", fontSize: 20, fontWeight: 700, color: "#10243E", flexShrink: 0 },
+  topCountSlash: { fontSize: 12, fontWeight: 500, color: "#8592A3", marginLeft: 2 },
+  mainRow: { flex: 1, display: "flex", gap: "clamp(8px,1.6vw,16px)", minHeight: 0 },
+  leftPanel: {
+    flex: "0 0 27%", background: "#FFFFFF", borderRadius: 22,
+    display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center",
+    boxShadow: "0 10px 24px -14px rgba(16,36,62,0.18)", padding: "10px 8px", minWidth: 0,
+  },
+  bigNumber: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(60px,13vh,110px)", fontWeight: 800, lineHeight: 1, transition: "color 0.4s ease", margin: "4px 0" },
+  stageLabel: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(17px,2.8vh,24px)", fontWeight: 700, transition: "color 0.4s ease", textAlign: "center" },
+  stageHint: { fontSize: 12, color: "#8592A3", marginTop: 4, textAlign: "center", lineHeight: 1.3 },
+  centerPanel: {
+    flex: "1 1 55%", background: "#FFFFFF", borderRadius: 26, position: "relative",
+    display: "flex", alignItems: "center", justifyContent: "center",
+    boxShadow: "0 12px 28px -14px rgba(16,36,62,0.2)", overflow: "hidden", minWidth: 0,
+  },
+  ringGlow: { position: "absolute", inset: 0, transition: "opacity 0.4s ease" },
+  tubeRow: { display: "flex", gap: "clamp(16px,2.8vw,32px)", height: "72%", position: "relative", zIndex: 1 },
+  tubeTrack: { position: "relative", width: "clamp(50px,8vw,74px)", height: "100%", background: "#F0F3F6", borderRadius: 24, overflow: "hidden", border: "1px solid #E6EAEF" },
+  tubeFill: { position: "absolute", bottom: 0, left: 0, right: 0, borderRadius: "0 0 24px 24px" },
+  ball: { position: "absolute", left: "50%", width: "clamp(34px,5.2vw,48px)", height: "clamp(34px,5.2vw,48px)", borderRadius: "50%", transform: "translateX(-50%)" },
+  rightPanel: { flex: "0 0 76px", display: "flex", flexDirection: "column", gap: 10, justifyContent: "center" },
+  resetBtn: { height: 46, borderRadius: 14, border: "1px solid #E6EAEF", background: "#FFFFFF", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 },
+  playBtn: { flex: 1, borderRadius: 16, border: "none", display: "flex", alignItems: "center", justifyContent: "center", boxShadow: "0 8px 18px -8px rgba(16,36,62,0.35)", transition: "background 0.4s ease, opacity 0.3s ease" },
+  overlay: { position: "absolute", inset: 0, background: "rgba(16,36,62,0.55)", display: "flex", alignItems: "center", justifyContent: "center", padding: 20, zIndex: 10 },
+  popupCard: { background: "#FFFFFF", borderRadius: 24, padding: "clamp(16px,3.2vh,26px) clamp(20px,3vw,32px)", boxShadow: "0 20px 40px -14px rgba(16,36,62,0.4)" },
+  popupTitle: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(17px,2.8vh,22px)", fontWeight: 700, color: "#10243E", textAlign: "center", marginBottom: 16 },
+  popupOptions: { display: "flex", gap: 12, justifyContent: "center" },
+  popupBtn: { width: "clamp(56px,8vw,76px)", height: "clamp(60px,9vh,80px)", borderRadius: 18, border: "1.5px solid #E6EAEF", background: "#F7F9FB", display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 2 },
+  popupBtnNum: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(22px,3.4vh,28px)", fontWeight: 700, color: "#10243E" },
+  popupBtnUnit: { fontSize: 11, color: "#8592A3" },
+  resultMsg: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(20px,3.4vh,30px)", fontWeight: 700, color: "#fff", marginTop: 10 },
+  prepareText: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(30px,5vh,46px)", fontWeight: 800, color: "#fff" },
+  prepareSub: { fontSize: 13.5, color: "#E4F6EE", marginTop: 8 },
+  completeTitle: { fontFamily: "'Space Grotesk', sans-serif", fontSize: "clamp(32px,5.6vh,50px)", fontWeight: 800, color: "#fff", marginTop: 6 },
+  completeSub: { fontSize: "clamp(14px,2.4vh,18px)", color: "#FFF3E8", marginTop: 4, fontWeight: 500 },
+  completeBtn: {
+    marginTop: 18, padding: "10px 22px", borderRadius: 14, border: "none",
+    background: "#FFFFFF", color: "#B85A1E", fontWeight: 700, fontSize: 14,
+    boxShadow: "0 8px 18px -8px rgba(0,0,0,0.35)",
+  },
+};
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<IncentiveSpirometer />);
+</script>
+</body>
+</html>
